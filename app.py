@@ -59,7 +59,7 @@ import requests
 import re
 
 from config import DefaultConfig
-
+from botbuilder.core.teams import TeamsInfo
 
 CONFIG = DefaultConfig()
 
@@ -107,15 +107,14 @@ else:
 
 
 async def on_error(context: TurnContext, error: Exception):
-    # This check writes out errors to console log .vs. app insights.
-    # NOTE: In production environment, you should consider logging this to Azure
-    #       application insights.
-    logger.error(f"Unhandled error in bot: {str(error)}")
-    traceback.print_exc()
-
-    # Don't send error messages to users - just log the error
-    # This prevents the "bot encountered an error" message from appearing
-    logger.info("Error logged but not shown to user to avoid confusion")
+    import traceback
+    stack = traceback.format_exc()
+    logger.error(f"❌ Unhandled error in bot: {error}\n{stack}")
+    # Optional: echo a safe message back to Teams (for testing only)
+    try:
+        await context.send_activity(f"⚠️ Internal bot error:\n```\n{error}\n```")
+    except Exception:
+        pass
 
 
 ADAPTER.on_turn_error = on_error
@@ -123,6 +122,7 @@ ADAPTER.on_turn_error = on_error
 # Initialize Databricks client with error handling
 def get_databricks_client():
     """Get Databricks WorkspaceClient with proper error handling"""
+
     try:
         # Debug environment variable loading
         logger.info(f"Loading Databricks configuration...")
@@ -297,6 +297,7 @@ class MyBot(ActivityHandler):
 
     async def get_or_create_user_session(self, turn_context: TurnContext) -> UserSession:
         """Get or create a user session based on Teams user information"""
+
         user_id = turn_context.activity.from_property.id
         
         # Check if we already have a session for this user
@@ -316,10 +317,45 @@ class MyBot(ActivityHandler):
                 # Update activity time for active session
                 session.update_activity()
                 return session
-        
-        # For all environments, require manual email input
-        # This ensures consistent behavior across emulator and Teams
-        return None
+
+        email, name = None, None
+
+        # --- 1️⃣ Try get_member() ---
+        try:
+            member = await TeamsInfo.get_member(turn_context, user_id)
+            email = getattr(member, "email", None) or getattr(member, "userPrincipalName", None)
+            name = getattr(member, "name", None)
+            logger.info(f"✅ Found Teams member via get_member(): {name} ({email})")
+        except Exception as e:
+            logger.warning(f"get_member() failed for {user_id}: {e}")
+
+        # --- 2️⃣ If still no email, try get_members() (helps 1:1 chats) ---
+        if not email:
+            try:
+                members = await TeamsInfo.get_members(turn_context)
+                if members and isinstance(members, list):
+                    for m in members:
+                        # Skip the bot itself
+                        if m.id != turn_context.activity.recipient.id:
+                            email = getattr(m, "email", None) or getattr(m, "userPrincipalName", None)
+                            name = getattr(m, "name", None)
+                            logger.info(f"✅ Found Teams member via get_members(): {name} ({email})")
+                            break
+            except Exception as e:
+                logger.warning(f"get_members() also failed for {user_id}: {e}")
+
+        # --- 3️⃣ Final fallback if Teams provides nothing ---
+        if not email:
+            email = "NoEmail"
+            name = getattr(turn_context.activity.from_property, "name", None) or "Unknown User"
+            logger.info(f"⚠️ No Teams email found for {user_id}. Using placeholder 'NoEmail'.")
+
+        # --- 4️⃣ Create and store session ---
+        session = UserSession(user_id, email, name or email.split("@")[0])
+        self.user_sessions[user_id] = session
+        self.email_sessions[email] = session
+        logger.info(f"✅ Created new user session for {session.get_display_name()}")
+        return session
 
     def _is_valid_email(self, email: str) -> bool:
         """Validate email address format"""
@@ -356,22 +392,22 @@ class MyBot(ActivityHandler):
                 "What questions should I ask?"
             ]
 
-    async def _create_session_with_manual_email(self, turn_context: TurnContext, email: str) -> UserSession:
-        """Create a user session with manually provided email"""
-        user_id = turn_context.activity.from_property.id
-        user_name = getattr(turn_context.activity.from_property, 'name', None) or email.split('@')[0]
+    # async def _create_session_with_manual_email(self, turn_context: TurnContext, email: str) -> UserSession:
+    #     """Create a user session with manually provided email"""
+    #     user_id = turn_context.activity.from_property.id
+    #     user_name = getattr(turn_context.activity.from_property, 'name', None) or email.split('@')[0]
         
-        # Create new user session
-        session = UserSession(user_id, email, user_name)
-        self.user_sessions[user_id] = session
-        self.email_sessions[email] = session
+    #     # Create new user session
+    #     session = UserSession(user_id, email, user_name)
+    #     self.user_sessions[user_id] = session
+    #     self.email_sessions[email] = session
         
-        # Remove from pending email input
-        if user_id in self.pending_email_input:
-            del self.pending_email_input[user_id]
+    #     # Remove from pending email input
+    #     if user_id in self.pending_email_input:
+    #         del self.pending_email_input[user_id]
         
-        logger.info(f"Created user session with manual email for {session.get_display_name()}")
-        return session
+    #     logger.info(f"Created user session with manual email for {session.get_display_name()}")
+    #     return session
 
     def create_feedback_card(self, message_id: str, user_id: str) -> Dict:
         """Create an Adaptive Card with thumbs up/down feedback buttons"""
@@ -499,46 +535,46 @@ class MyBot(ActivityHandler):
         question = turn_context.activity.text.strip()
         user_id = turn_context.activity.from_property.id
         
-        # Check if user is waiting to provide email manually
-        if user_id in self.pending_email_input:
-            if question.lower() == "cancel":
-                # User wants to cancel email input
-                del self.pending_email_input[user_id]
-                await turn_context.send_activity(
-                    "❌ **Email Input Cancelled**\n\n"
-                    "You can try again later by typing any message. I'll ask for your email again if needed."
-                )
-                return
-            elif self._is_valid_email(question):
-                # User provided a valid email
-                user_session = await self._create_session_with_manual_email(turn_context, question)
+        # # Check if user is waiting to provide email manually
+        # if user_id in self.pending_email_input:
+        #     if question.lower() == "cancel":
+        #         # User wants to cancel email input
+        #         del self.pending_email_input[user_id]
+        #         await turn_context.send_activity(
+        #             "❌ **Email Input Cancelled**\n\n"
+        #             "You can try again later by typing any message. I'll ask for your email again if needed."
+        #         )
+        #         return
+        #     elif self._is_valid_email(question):
+        #         # User provided a valid email
+        #         user_session = await self._create_session_with_manual_email(turn_context, question)
                 
-                # Get sample questions based on space ID
-                sample_questions = self._get_sample_questions()
-                questions_text = "\n".join([f"- \"{q}\"" for q in sample_questions])
+        #         # Get sample questions based on space ID
+        #         sample_questions = self._get_sample_questions()
+        #         questions_text = "\n".join([f"- \"{q}\"" for q in sample_questions])
                 
-                await turn_context.send_activity(
-                    f"✅ **Email Confirmed!**\n\n"
-                    f"Welcome, {user_session.name}! I've successfully logged you in as {user_session.email}.\n\n"
-                    f"Now you can ask me questions about your data. Try asking something like:\n"
-                    f"{questions_text}"
-                )
-                return
-            else:
-                await turn_context.send_activity(
-                    "❌ **Invalid Email Format**\n\n"
-                    "Please provide a valid email address (e.g., john.doe@company.com).\n\n"
-                    "Type `cancel` to stop the email input process."
-                )
-                return
+        #         await turn_context.send_activity(
+        #             f"✅ **Email Confirmed!**\n\n"
+        #             f"Welcome, {user_session.name}! I've successfully logged you in as {user_session.email}.\n\n"
+        #             f"{turn_context.activity.from_property}"
+        #             f"Now you can ask me questions about your data. Try asking something like:\n"
+        #             f"{questions_text}"
+        #         )
+        #         return
+        #     else:
+        #         await turn_context.send_activity(
+        #             "❌ **Invalid Email Format**\n\n"
+        #             "Please provide a valid email address (e.g., john.doe@company.com).\n\n"
+        #             "Type `cancel` to stop the email input process."
+        #         )
+        #         return
         
         # Get or create user session
         user_session = await self.get_or_create_user_session(turn_context)
         
-        # If we couldn't create a session (no email), ask user to identify themselves
-        if not user_session:
-            await self._handle_user_identification(turn_context, question)
-            return
+        # # If we couldn't create a session (no email), ask user to identify themselves
+            # await self._handle_user_identification(turn_context, question)
+            # return
         
         # Handle special commands first (before checking for timeout reset)
         if await self._handle_special_commands(turn_context, question, user_session):
@@ -547,11 +583,15 @@ class MyBot(ActivityHandler):
         # Check if conversation was reset due to timeout (only for data questions, not commands)
         if user_session.conversation_id is None and user_session.user_id in self.user_sessions:
             # This means the conversation was reset due to timeout
+            # await turn_context.send_activity(
+            #     "⏰ **Conversation Reset**\n\n"
+            #     "Your previous conversation has expired (4+ hours of inactivity). "
+            #     "Starting fresh with a new conversation context.\n\n"
+            #     "I'm working on your answer now!"
+            # )
+
             await turn_context.send_activity(
-                "⏰ **Conversation Reset**\n\n"
-                "Your previous conversation has expired (4+ hours of inactivity). "
-                "Starting fresh with a new conversation context.\n\n"
-                "I'm working on your answer now!"
+                "🤖 **Starting New Conversation...**\n\n"
             )
         
         # Process the message with user context
@@ -587,113 +627,111 @@ class MyBot(ActivityHandler):
         except Exception as e:
             logger.error(f"Error processing message for {user_session.get_display_name()}: {str(e)}")
             await turn_context.send_activity(
-                f"**👤 {user_session.name}**\n\n❌ An error occurred while processing your request."
+                f"**👤 {user_session.name}**\n\n❌ An error occurred while processing your request.\n\n Note: This often occurs when the output is too long, please try adjusting your question to request a shorter answer."
             )
-            # Send feedback card for error responses too
-            await self._send_feedback_card(turn_context, user_session)
 
-    async def _handle_user_identification(self, turn_context: TurnContext, question: str):
-        """Handle cases where user email is not available"""
-        user_id = turn_context.activity.from_property.id
+#     async def _handle_user_identification(self, turn_context: TurnContext, question: str):
+#         """Handle cases where user email is not available"""
+#         user_id = turn_context.activity.from_property.id
         
-        if question.lower() in ["help", "/help", "commands", "/commands"]:
-            help_message = f"""🤖 **Databricks Genie Bot Information**
+#         if question.lower() in ["help", "/help", "commands", "/commands"]:
+#             help_message = f"""🤖 **Databricks Genie Bot Information**
 
-**What I do:**
-I'm a Teams bot that connects to a Databricks Genie Space, allowing you to interact with your data through natural language queries directly in Teams.
+# **What I do:**
+# I'm a Teams bot that connects to a Databricks Genie Space, allowing you to interact with your data through natural language queries directly in Teams.
 
-**How I work:**
-• I connect to your Databricks workspace using configured credentials
-• Your conversation context is maintained between sessions for continuity
-• I remember our conversation history to provide better follow-up responses
+# **How I work:**
+# • I connect to your Databricks workspace using configured credentials
+# • Your conversation context is maintained between sessions for continuity
+# • I remember our conversation history to provide better follow-up responses
 
-**Session Management:**
-• Conversations automatically reset after **4 hours** of inactivity
-• You can manually reset anytime by typing `reset` or `new chat`
-• Your email is used **only for logging queries in Genie** - not for AI processing
+# **Session Management:**
+# • Conversations automatically reset after **4 hours** of inactivity
+# • You can manually reset anytime by typing `reset` or `new chat`
+# • Your email is used **only for logging queries in Genie** - not for AI processing
 
-**Available Commands:**
-• `help` - Show this information
-• `info` - Get help getting started
-• `whoami` - Display your user information
-• `reset` - Start a fresh conversation
-• `new chat` - Start a fresh conversation
-• `logout` - Clear your session
+# **Available Commands:**
+# • `help` - Show this information
+# • `info` - Get help getting started
+# • `whoami` - Display your user information
+# • `reset` - Start a fresh conversation
+# • `new chat` - Start a fresh conversation
+# • `logout` - Clear your session
 
-**Need Help?**
-Contact the bot administrator at: {CONFIG.ADMIN_CONTACT_EMAIL}"""
+# **Need Help?**
+# Contact the bot administrator at: {CONFIG.ADMIN_CONTACT_EMAIL}"""
             
-            await turn_context.send_activity(help_message)
-        elif question.lower() in ["info", "/info"]:
-            info_text = """🤖 **Welcome to the Genie Bot - User Logging Required**
+#             await turn_context.send_activity(help_message)
+#         elif question.lower() in ["info", "/info"]:
+#             info_text = """🤖 **Welcome to the Genie Bot - User Logging Required**
 
-I need your email address to log queries in Genie for tracking purposes.
+# I need your email address to log queries in Genie for tracking purposes.
 
-**Quick Start:**
-- Type `email` to provide your email address
-- I'll validate the format and create your session
+# **Quick Start:**
+# - Type `email` to provide your email address
+# - I'll validate the format and create your session
 
-**What happens next:**
-- Once logged in, you can ask me questions about your data
-- I'll remember our conversation context
-- You can ask follow-up questions
+# **What happens next:**
+# - Once logged in, you can ask me questions about your data
+# - I'll remember our conversation context
+# - You can ask follow-up questions
 
-**Learn More:**
-- Type `help` to learn more about the Genie Bot
-- Type `info` for help getting started
+# **Learn More:**
+# - Type `help` to learn more about the Genie Bot
+# - Type `info` for help getting started
 
-Ready to get started? Type `email` to provide your email address!"""
-            await turn_context.send_activity(info_text)
-        elif question.lower() in ["email", "provide email", "enter email"]:
-            # User wants to provide email manually
-            self.pending_email_input[user_id] = True
-            await turn_context.send_activity(
-                "📧 **User Logging in Genie**\n\n"
-                "Please provide your email address (e.g., captain.planet@company.com).\n\n"
-                "Type `cancel` if you want to stop this process."
-            )
-        else:
-            await turn_context.send_activity(
-                "🤖 **Welcome to the Genie Bot**\n\n"
-                "I need your email address to log queries in Genie for tracking purposes.\n\n"
-                "**Quick Options:**\n"
-                "- Type `email` to provide your email address\n"
-                "- Type `help` to learn more about the Genie Bot\n"
-                "- Type `info` for help getting started\n\n"
-                "Once logged in, you'll be able to ask me questions about your data!"
-            )
+# Ready to get started? Type `email` to provide your email address!"""
+#             await turn_context.send_activity(info_text)
+#         elif question.lower() in ["email", "provide email", "enter email"]:
+#             # User wants to provide email manually
+#             self.pending_email_input[user_id] = True
+#             await turn_context.send_activity(
+#                 "📧 **User Logging in Genie**\n\n"
+#                 "Please provide your email address (e.g., captain.planet@company.com).\n\n"
+#                 "Type `cancel` if you want to stop this process."
+#             )
+#         else:
+#             await turn_context.send_activity(
+#                 "🤖 **Welcome to the Genie Bot**\n\n"
+#                 "I need your email address to log queries in Genie for tracking purposes.\n\n"
+#                 "**Quick Options:**\n"
+#                 "- Type `email` to provide your email address\n"
+#                 "- Type `help` to learn more about the Genie Bot\n"
+#                 "- Type `info` for help getting started\n\n"
+#                 "Once logged in, you'll be able to ask me questions about your data!"
+#             )
 
     async def _handle_special_commands(self, turn_context: TurnContext, question: str, user_session: UserSession) -> bool:
         """Handle special commands. Returns True if command was handled."""
         
         # Special emulator command for setting identity
-        if question.lower().startswith("/setuser ") and turn_context.activity.channel_id == "emulator":
-            # Format: /setuser john.doe@company.com John Doe
-            parts = question.split(" ", 2)
-            if len(parts) >= 2:
-                email = parts[1]
-                name = parts[2] if len(parts) > 2 else email.split('@')[0]
+        # if question.lower().startswith("/setuser ") and turn_context.activity.channel_id == "emulator":
+        #     # Format: /setuser john.doe@company.com John Doe
+        #     parts = question.split(" ", 2)
+        #     if len(parts) >= 2:
+        #         email = parts[1]
+        #         name = parts[2] if len(parts) > 2 else email.split('@')[0]
                 
-                # Update existing session or create new one
-                user_id = turn_context.activity.from_property.id
-                session = UserSession(user_id, email, name)
-                self.user_sessions[user_id] = session
-                self.email_sessions[email] = session
+        #         # Update existing session or create new one
+        #         user_id = turn_context.activity.from_property.id
+        #         session = UserSession(user_id, email, name)
+        #         self.user_sessions[user_id] = session
+        #         self.email_sessions[email] = session
                 
-                await turn_context.send_activity(
-                    f"✅ **Identity Updated!**\n\n"
-                    f"**Name:** {session.name}\n"
-                    f"**Email:** {session.email}\n\n"
-                    f"You can now ask me questions about your data!"
-                )
-                return True
-            else:
-                await turn_context.send_activity(
-                    "❌ **Invalid format**\n\n"
-                    "Use: `/setuser your.email@company.com Your Name`\n"
-                    "Example: `/setuser john.doe@company.com John Doe`"
-                )
-                return True
+        #         await turn_context.send_activity(
+        #             f"✅ **Identity Updated!**\n\n"
+        #             f"**Name:** {session.name}\n"
+        #             f"**Email:** {session.email}\n\n"
+        #             f"You can now ask me questions about your data!"
+        #         )
+        #         return True
+        #     else:
+        #         await turn_context.send_activity(
+        #             "❌ **Invalid format**\n\n"
+        #             "Use: `/setuser your.email@company.com Your Name`\n"
+        #             "Example: `/setuser john.doe@company.com John Doe`"
+        #         )
+        #         return True
         
         # Info command
         if question.lower() in ["info", "/info"]:
@@ -708,15 +746,14 @@ Ready to get started? Type `email` to provide your email address!"""
 
 **User Commands:**
 - `whoami` - Show your user information
-- `help` - Show detailed bot information
-- `logout` - Clear your session (you'll be re-identified on next message)"""
+- `help` - Show detailed bot information"""
 
-            if is_emulator:
-                info_text += """
+#             if is_emulator:
+#                 info_text += """
 
-**🔧 Emulator Testing Commands:**
-- `/setuser your.email@company.com Your Name` - Set your identity for testing
-- Example: `/setuser john.doe@company.com John Doe`"""
+# **🔧 Emulator Testing Commands:**
+# - `/setuser your.email@company.com Your Name` - Set your identity for testing
+# - Example: `/setuser john.doe@company.com John Doe`"""
 
             info_text += f"""
 
@@ -746,21 +783,30 @@ Contact the bot administrator at: {CONFIG.ADMIN_CONTACT_EMAIL}"""
             await turn_context.send_activity(user_info)
             return True
 
-        # Logout command
-        if question.lower() in ["logout", "/logout", "sign out", "disconnect"]:
-            # Clear user session
-            user_id = user_session.user_id
-            email = user_session.email
+        # # Logout command
+        # if question.lower() in ["logout", "/logout", "sign out", "disconnect"]:
+        #     # Clear user session
+        #     user_id = user_session.user_id
+        #     email = user_session.email
             
-            if user_id in self.user_sessions:
-                del self.user_sessions[user_id]
-            if email in self.email_sessions:
-                del self.email_sessions[email]
+        #     if user_id in self.user_sessions:
+        #         del self.user_sessions[user_id]
+        #     if email in self.email_sessions:
+        #         del self.email_sessions[email]
             
+        #     await turn_context.send_activity(
+        #         f"👋 **Goodbye {user_session.name}!**\n\n"
+        #         "Your session has been cleared. You'll be re-identified when you send your next message."
+        #     )
+        #     return True
+
+        # Hello command
+        if question.lower() in ["hi", "hello", "start", "hey"]:
             await turn_context.send_activity(
-                f"👋 **Goodbye {user_session.name}!**\n\n"
-                "Your session has been cleared. You'll be re-identified when you send your next message."
+                f"👋 **Hello {user_session.name}!**\n\n"
+                "You can ask me questions about your data. Type `help` to see what I can do."
             )
+
             return True
 
         # Help command
@@ -786,7 +832,6 @@ I'm a Teams bot that connects to a Databricks Genie Space, allowing you to inter
 • `whoami` - Display your user information
 • `reset` - Start a fresh conversation
 • `new chat` - Start a fresh conversation
-• `logout` - Clear your session
 
 **Need Help?**
 Contact the bot administrator at: {CONFIG.ADMIN_CONTACT_EMAIL}"""
@@ -797,7 +842,7 @@ Contact the bot administrator at: {CONFIG.ADMIN_CONTACT_EMAIL}"""
         # New conversation triggers
         new_conversation_triggers = [
             "new conversation", "new chat", "start over", "reset", "clear conversation",
-            "/new", "/reset", "/clear", "/start", "begin again", "fresh start"
+            "/new", "/reset", "/clear", "/start", "begin again", "fresh start", "logout", "/logout"
         ]
         
         if question.lower() in [trigger.lower() for trigger in new_conversation_triggers]:
@@ -1192,48 +1237,125 @@ Ready to get started? Type `email` to begin!"""
                 await turn_context.send_activity(welcome_message)
 
 
-BOT = MyBot()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.info("🚀 Starting Databricks Genie Bot App")
+
+CONFIG = DefaultConfig()
+
+if CONFIG.APP_ID and CONFIG.APP_PASSWORD:
+    ADAPTER = CloudAdapter(ConfigurationBotFrameworkAuthentication(CONFIG))
+else:
+    SETTINGS = BotFrameworkAdapterSettings("", "")
+    ADAPTER = BotFrameworkAdapter(SETTINGS)
+
+BOT = MyBot()
+is_warmed_up = False
+
+async def warm_up_bot():
+    """Run lightweight initialization to prepare the bot for first request."""
+    global is_warmed_up
+    if is_warmed_up:
+        return
+    logger.info("🔄 Warming up bot components...")
+    try:
+        await BOT.initialize_async() if hasattr(BOT, "initialize_async") else None
+        # Optionally ping downstream dependencies here
+        is_warmed_up = True
+        logger.info("✅ Bot warmed up successfully.")
+    except Exception as e:
+        logger.error(f"❌ Warm-up failed: {e}")
+
+async def root(req: Request) -> Response:
+    """Root endpoint for Azure probe."""
+    return web.Response(text="✅ Databricks Genie Bot is running")
+
+async def health(req: Request) -> Response:
+    """Health check endpoint; also ensures bot is warmed up."""
+    global is_warmed_up
+    if not is_warmed_up:
+        logger.info("Health probe triggered - warming up bot...")
+        await warm_up_bot()
+    return json_response({"status": "ok", "warmed_up": is_warmed_up})
 
 async def messages(req: Request) -> Response:
-    if "application/json" in req.headers["Content-Type"]:
-        body = await req.json()
-    else:
+    """Main endpoint for incoming Bot Framework messages."""
+    global is_warmed_up
+
+    content_type = req.headers.get("Content-Type", "").lower()
+    if "application/json" not in content_type:
+        logger.error(f"Unsupported Content-Type: {content_type}")
         return Response(status=415)
 
+    body = await req.json()
+    auth_header = req.headers.get("Authorization", "")
     activity = Activity().deserialize(body)
+
+    if not is_warmed_up:
+        logger.warning("⚠️ Cold start detected — warming up before processing message...")
+
+        try:
+            async def send_warming_notice(turn_context: TurnContext):
+                await turn_context.send_activity(
+                    "⏳ **The Databricks Genie Bot is starting up...**\n\n"
+                    "Please wait a few seconds while I get ready."
+                )
+
+            await ADAPTER.process_activity(activity, auth_header, send_warming_notice)
+            logger.info("📨 Sent 'warming up' notice to Teams successfully.")
+        except Exception as e:
+            logger.error(f"Failed to send 'warming up' notice: {e}", exc_info=True)
+
+        await warm_up_bot()
+
+        try:
+            logger.info("🔁 Replaying user message after warm-up...")
+            await ADAPTER.process_activity(activity, auth_header, BOT.on_turn)
+            logger.info("✅ Warm-up complete and user message processed.")
+            return Response(status=201)
+        except Exception as e:
+            logger.error(f"❌ Error reprocessing message after warm-up: {e}", exc_info=True)
+            return Response(status=500)
+    return await process_incoming_activity(req)
+
+
+async def process_incoming_activity(req: Request) -> Response:
+    """Handle adapter dispatch for the incoming activity."""
     auth_header = req.headers.get("Authorization", "")
 
     try:
-        # Handle different adapter types
-        if hasattr(ADAPTER, 'process'):
-            # CloudAdapter
-            response = await ADAPTER.process(req, BOT)
-            if response:
-                return json_response(data=response.body, status=response.status)
-            return Response(status=201)
-        else:
-            # BotFrameworkAdapter - use process_activity with correct signature
-            response = await ADAPTER.process_activity(activity, auth_header, BOT.on_turn)
-            if response:
-                return json_response(data=response.body, status=response.status)
-            return Response(status=201)
+        if hasattr(ADAPTER, "process"):
+            return await ADAPTER.process(req, BOT)
+
+        body = await req.json()
+        activity = Activity().deserialize(body)
+        response = await ADAPTER.process_activity(activity, auth_header, BOT.on_turn)
+
+        if isinstance(response, InvokeResponse):
+            return json_response(data=response.body, status=response.status)
+        return Response(status=201)
     except Exception as e:
-        logger.error(f"Error processing request: {str(e)}")
+        logger.error(f"Error processing activity: {e}", exc_info=True)
         return Response(status=500)
 
 
-def init_func(argv):
-    APP = web.Application(middlewares=[aiohttp_error_middleware])
-    APP.router.add_post("/api/messages", messages)
-    return APP
+async def on_startup(app):
+    logger.info("🌅 App startup detected — warming bot proactively...")
+    await warm_up_bot()
+    #await send_warming_up_message()
+    
 
+def init_func(argv=None):
+    app = web.Application(middlewares=[aiohttp_error_middleware])
+    app.router.add_get("/", root)
+    app.router.add_get("/health", health)
+    app.router.add_post("/api/messages", messages)
+    app.on_startup.append(on_startup)
+    return app
 
 if __name__ == "__main__":
-    APP = init_func(None)
-    try:
-        HOST = "0.0.0.0"
-        PORT = int(os.environ.get("PORT", CONFIG.PORT))
-        web.run_app(APP, host=HOST, port=PORT)
-    except Exception as error:
-        raise error
+    app = init_func(None)
+    host = "0.0.0.0"
+    port = int(os.environ.get("PORT", CONFIG.PORT))
+    web.run_app(app, host=host, port=port)
